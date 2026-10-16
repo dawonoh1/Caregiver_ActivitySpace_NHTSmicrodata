@@ -1,0 +1,23 @@
+# Data files
+*.csv
+*.rds
+*.RDS
+*.sav
+*.sas7bdat
+
+# R session files
+.Rhistory
+.RData
+.RDataTmp*
+.Rproj.user/
+.Ruserdata
+
+# Keys and secrets
+.Renviron
+.env
+*.key
+*.pem
+*.p12
+*secret*
+*credentials*
+*token*

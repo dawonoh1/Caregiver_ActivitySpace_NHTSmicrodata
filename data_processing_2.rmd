@@ -1,0 +1,1154 @@
+---
+title: "data_processing_2"
+author: "dawon"
+date: "2026-07-09"
+output: html_document
+---
+
+### 10m buffer applied
+
+
+
+
+### Constucting Samples: Household without children and Household with children
+## =============================================================================
+## Tour-level Activity Space Construction (Hasanzadeh et al. 2017 approach)
+## NHTS 2017 | Caregiver travel with/without children
+##
+## Geographic resolution: Census block-group centroids (from Census TIGER)
+## Activity space: Minimum Convex Polygon (MCP)
+##   - Home location buffered 100 m
+##   - All other stops buffered 100 m
+##   - Union of buffers → MCP (convex hull)
+## Outcome: log(area in km²) at the tour level
+##
+## Required NHTS files (assumed in data_dir):
+##   hhctbg.csv      — household home BG
+##   tripctbg.csv    — per-trip origin/destination BG
+##   trippub.csv     — trip public file (tour ID, child accompaniment flags)
+##   hhpub.csv       — household public file (household-level controls)
+##   perpub.csv      — person public file (person-level controls)
+## =============================================================================
+
+
+```{r include=FALSE}
+library(tidyverse)
+library(sf)
+library(tigris)   # Census TIGER/Line shapefiles → BG centroids
+#library(lwgeom)   # convex hull on sf geometry collections
+
+options(tigris_use_cache = TRUE)
+```
+
+
+```{r}
+## ---------------------------------------------------------------------------
+## 0. Paths — edit these
+## ---------------------------------------------------------------------------
+data_dir   <- "C:/Users/ohdaw/OneDrive/Documents/R_Projects/CaregiverActivitySpace/data"          # folder with all NHTS CSVs 
+output_dir <- "C:/Users/ohdaw/OneDrive/Documents/R_Projects/CaregiverActivitySpace/results"            # where results are written
+
+## ---------------------------------------------------------------------------
+## 1. Load NHTS geographic and trip files
+## ---------------------------------------------------------------------------
+hhctbg  <- read_csv(file.path(data_dir, "hhctbg.csv"),
+                    col_types = cols(.default = "c"))
+tripctbg <- read_csv(file.path(data_dir, "tripctbg.csv"),
+                     col_types = cols(.default = "c"))
+trippub  <- read_csv(file.path(data_dir, "trippub.csv"),
+                     col_types = cols(.default = "c"))
+hhpub    <- read_csv(file.path(data_dir, "hhpub.csv"),
+                     col_types = cols(.default = "c"))
+perpub   <- read_csv(file.path(data_dir, "perpub.csv"),
+                     col_types = cols(.default = "c"))
+```
+
+
+## ---------------------------------------------------------------------------
+## 2. Build household-level child count (numu10inhh)
+##    Mirrors the Python logic in us_data_processing_1.rmd:
+##      numu10inhh = YOUNGCHILD (ages 0–5 from NHTS HH variable)
+##                 + num_5_9   (ages 5–9 counted from perpub roster)
+##
+##    YOUNGCHILD is a household-level variable already in trippub/perpub.
+##    Children under 5 are NOT in the perpub roster; YOUNGCHILD captures them.
+##    Children 5–9 ARE in the perpub roster via R_AGE_IMP.
+## ---------------------------------------------------------------------------
+
+```{r}
+# Count ages 5–9 per household from perpub roster
+hh_5_9 <- perpub %>%
+  mutate(age = as.integer(R_AGE)) %>%    # perpub uses R_AGE; R_AGE_IMP is only in trippub
+  filter(!is.na(age)) %>%
+  group_by(HOUSEID) %>%
+  summarise(num_5_9 = sum(age >= 5 & age <= 9), .groups = "drop")
+ 
+# YOUNGCHILD: household-level count of ages 0–5, lives in hhpub (not trippub)
+hh_youngchild <- hhpub %>%
+  select(HOUSEID, YOUNGCHILD) %>%
+  distinct(HOUSEID, .keep_all = TRUE) %>%
+  mutate(YOUNGCHILD = as.integer(YOUNGCHILD),
+         YOUNGCHILD = replace_na(YOUNGCHILD, 0L))
+ 
+# Combine: numu10inhh = YOUNGCHILD + num_5_9
+hh_child_count <- hh_youngchild %>%
+  left_join(hh_5_9, by = "HOUSEID") %>%
+  mutate(
+    num_5_9    = replace_na(num_5_9, 0L),
+    numu10inhh = YOUNGCHILD + num_5_9
+  ) %>%
+  select(HOUSEID, YOUNGCHILD, num_5_9, numu10inhh)
+```
+
+
+```{r}
+## ---------------------------------------------------------------------------
+## 2b. Build household-level child counts across the full 0-17 range
+##
+##   numu10inhh   = YOUNGCHILD (0-5) + num_5_9   (5-9)   [as before]
+##   num_10_17    = count of ages 10-17 from perpub roster
+##   total_child_0_17 = numu10inhh + num_10_17
+##
+##   no_child   : total_child_0_17 == 0   (no children of ANY age 0-17)
+##   with_child : numu10inhh >= 1          (has a child 0-9, regardless of
+##                whether 10-17 kids are also present)
+## ---------------------------------------------------------------------------
+
+# Count ages 10-17 per household from perpub roster
+hh_10_17 <- perpub %>%
+  mutate(age = as.integer(R_AGE)) %>%
+  filter(!is.na(age)) %>%
+  group_by(HOUSEID) %>%
+  summarise(num_10_17 = sum(age >= 10 & age <= 17), .groups = "drop")
+
+# Combine with your existing numu10inhh (0-9) build
+hh_child_count_full <- hh_child_count %>%           # from your original 2b: HOUSEID, YOUNGCHILD, num_5_9, numu10inhh
+  left_join(hh_10_17, by = "HOUSEID") %>%
+  mutate(
+    num_10_17         = replace_na(num_10_17, 0L),
+    total_child_0_17  = numu10inhh + num_10_17
+  )
+```
+
+
+```{r}
+## ---------------------------------------------------------------------------
+## 2c. Classify households into comparison groups
+##     no_child   : total_child_0_17 == 0   (no kids 0-17 at all)
+##     with_child : numu10inhh >= 1          (has a child 0-9; 10-17 kids OK too)
+##     (households with only 10-17 kids and no 0-9 kids fall into neither
+##      group and are dropped from the comparison sample)
+## ---------------------------------------------------------------------------
+
+hh_group <- hh_child_count_full %>%
+  mutate(
+    child_group = case_when(
+      total_child_0_17 == 0 ~ "no_child",
+      numu10inhh >= 1       ~ "with_child",
+      TRUE                  ~ NA_character_   # only-10-17-kids HHs -> excluded
+    )
+  )
+
+message("No-child households (0-17 clean):        ",
+        sum(hh_group$child_group == "no_child", na.rm = TRUE))
+message("With-child households (has child 0-9):    ",
+        sum(hh_group$child_group == "with_child", na.rm = TRUE))
+message("Excluded (only children 10-17, no 0-9):    ",
+        sum(is.na(hh_group$child_group) & hh_group$total_child_0_17 > 0))
+```
+
+
+```{r}
+## ---------------------------------------------------------------------------
+## 2c. Pull household-level control variables (from hhpub)
+##     - NUMADLT      : number of adults in HH (splits caregiving load)
+##     - HHVEHCNT     : household vehicle count
+##     - HHFAMINC     : household income category
+##     - HHSIZE       : total household size (to flag other dependents)
+##     - URBRUR       : urbanicity (01 urban / 02 suburban-cluster / 03 rural)
+##     - MSACAT       : metro status
+##     - HH_CBSA      : CBSA code (for FE if needed)
+##     - LIF_CYC      : life-cycle category (can help flag elderly/other deps)
+## ---------------------------------------------------------------------------
+
+hh_controls <- hhpub %>%
+  select(HOUSEID, NUMADLT, HHVEHCNT, HHFAMINC, HHSIZE,
+         URBRUR, MSACAT, HH_CBSA, LIF_CYC) %>%
+  distinct(HOUSEID, .keep_all = TRUE) %>%
+  mutate(
+    NUMADLT   = as.integer(NUMADLT),
+    HHVEHCNT  = as.integer(HHVEHCNT),
+    HHSIZE    = as.integer(HHSIZE),
+    veh_per_adult = if_else(NUMADLT > 0, HHVEHCNT / NUMADLT, NA_real_)
+  )
+```
+
+
+```{r}
+## ---------------------------------------------------------------------------
+## 2d. Flag presence of other dependents (older kids 10-15, or elderly)
+##     so the "no_child" group isn't silently contaminated by other
+##     caregiving obligations. Adjust age bands to whatever perpub allows.
+## ---------------------------------------------------------------------------
+
+hh_other_deps <- perpub %>%
+  mutate(age = as.integer(R_AGE)) %>%
+  filter(!is.na(age)) %>%
+  group_by(HOUSEID) %>%
+  summarise(
+    has_child_10_15 = any(age >= 10 & age <= 15, na.rm = TRUE),
+    has_elderly_70p = any(age >= 70, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+
+```{r}
+## ---------------------------------------------------------------------------
+## 2e. Combine into a single household-level comparison frame
+## ---------------------------------------------------------------------------
+
+hh_compare <- hh_group %>%
+  left_join(hh_controls,    by = "HOUSEID") %>%
+  left_join(hh_other_deps,  by = "HOUSEID") %>%
+  mutate(
+    has_child_10_15 = replace_na(has_child_10_15, FALSE),
+    has_elderly_70p = replace_na(has_elderly_70p, FALSE)
+  ) %>%
+  filter(child_group %in% c("no_child", "with_child"))
+
+## Optional: drop no_child households that actually have other dependents,
+## so "no_child" means no caregiving-relevant dependents at all
+hh_compare_clean <- hh_compare %>%
+  filter(!(child_group == "no_child" & (has_child_10_15 | has_elderly_70p)))
+
+message("Clean no-child HHs (no other dependents): ",
+        sum(hh_compare_clean$child_group == "no_child"))
+message("With-child HHs: ",
+        sum(hh_compare_clean$child_group == "with_child"))
+```
+
+
+```{r}
+## ---------------------------------------------------------------------------
+## 3. Restrict to adult respondents (23-69) and attach person-level controls
+##    - R_AGE_IMP, R_SEX_IMP : age, sex
+##    - WORKER               : employment status
+##    - TDWKND (from trippub, joined later at trip level): weekday/weekend
+## ---------------------------------------------------------------------------
+
+person_core <- perpub %>%
+  mutate(age = as.integer(R_AGE)) %>%
+  filter(age >= 23, age <= 69) %>%
+  select(HOUSEID, PERSONID, R_AGE = age, R_SEX_IMP, WORKER) %>%
+  inner_join(hh_compare_clean, by = "HOUSEID")
+
+message("Adult respondents in comparison sample: ", nrow(person_core))
+message("  no_child: ",   sum(person_core$child_group == "no_child"))
+message("  with_child: ", sum(person_core$child_group == "with_child"))
+
+## Quick balance check across groups before you go further
+person_core %>%
+  group_by(child_group) %>%
+  summarise(
+    n              = n(),
+    mean_age       = mean(R_AGE, na.rm = TRUE),
+    pct_worker     = mean(WORKER == "01", na.rm = TRUE),
+    mean_hhfaminc  = mean(as.integer(HHFAMINC), na.rm = TRUE),
+    mean_veh_adult = mean(veh_per_adult, na.rm = TRUE),
+    pct_urban      = mean(URBRUR == "01", na.rm = TRUE)
+  )
+```
+
+
+
+
+### Constucting Activity Spaces
+## =============================================================================
+## Daily (person-level) Activity Space — No-child vs With-child(0-9) households
+## Buffers built from ACTUAL block group polygons, not centroids
+## Home -> 100 m buffer around BG polygon boundary
+## Each destination -> 100 m buffer around its BG polygon boundary
+## Union all buffers (dedup by GEOID) -> convex hull -> area in km^2
+## CRS: EPSG:5070 (NAD83 Conus Albers, metres, equal area)
+## =============================================================================
+
+```{r}
+## ---------------------------------------------------------------------------
+## 0. Restrict trip_core to the two comparison groups (not caregiver_hh)
+## ---------------------------------------------------------------------------
+compare_hh_ids <- hh_compare_clean$HOUSEID   # no_child + with_child households
+
+trip_core_cmp <- trippub %>%
+  filter(
+    HOUSEID %in% compare_hh_ids,
+    as.integer(R_AGE_IMP) >= 23,
+    as.integer(R_AGE_IMP) <= 69
+  ) %>%
+  select(
+    HOUSEID, PERSONID, TDTRPNUM,
+    WHYTO, WHYFROM, TDWKND,
+    R_AGE_IMP, R_SEX_IMP, DRIVER, WORKER,
+    HHVEHCNT, HHFAMINC, HHSIZE, NUMADLT, LIF_CYC,
+    URBRUR, MSACAT, HH_CBSA, WTTRDFIN
+  ) %>%
+  mutate(trip_num = as.integer(TDTRPNUM)) %>%
+  arrange(HOUSEID, PERSONID, trip_num)
+
+## Attach the household group label
+trip_core_cmp <- trip_core_cmp %>%
+  left_join(hh_group %>% select(HOUSEID, child_group), by = "HOUSEID") %>%
+  filter(!is.na(child_group))
+```
+
+
+```{r}
+## ---------------------------------------------------------------------------
+## 1. Build GEOIDs for home and destinations (same construction as before)
+## ---------------------------------------------------------------------------
+hhctbg_geo <- hhctbg %>%
+  mutate(
+    home_geoid = paste0(
+      str_pad(HHSTFIPS, 2, "left", "0"),
+      str_pad(HHCNTYFP, 3, "left", "0"),
+      str_pad(HHCT,     6, "left", "0"),
+      str_pad(HHBG,     1, "left", "0")
+    )
+  ) %>%
+  select(HOUSEID, home_geoid) %>%
+  filter(HOUSEID %in% compare_hh_ids)
+
+tripctbg_geo <- tripctbg %>%
+  filter(DEST_COUNTRY == "USA") %>%
+  mutate(
+    dest_geoid = paste0(
+      str_pad(DEST_ST,   2, "left", "0"),
+      str_pad(DEST_CNTY, 3, "left", "0"),
+      str_pad(DEST_CT,   6, "left", "0"),
+      str_pad(DEST_BG,   1, "left", "0")
+    )
+  ) %>%
+  select(HOUSEID, PERSONID, TDTRPNUM, dest_geoid) %>%
+  filter(HOUSEID %in% compare_hh_ids)
+```
+
+
+```{r}
+## ---------------------------------------------------------------------------
+## 1b. Ensure R is using a clean, working temp directory (not the ESTsoft path)
+##     Run this once per session, before any tigris/sf downloads.
+## ---------------------------------------------------------------------------
+Sys.setenv(TMPDIR = "C:/Users/ohdaw/AppData/Local/Temp")
+message("Current tempdir(): ", tempdir())
+if (grepl("ESTsoft", tempdir())) {
+  warning("tempdir() still points to ESTsoft path — restart R before proceeding.")
+} 
+```
+
+
+```{r}
+## ---------------------------------------------------------------------------
+## STEP 1: Fix .Renviron — remove the broken TIGRIS_CACHE_DIR line
+## Paste this in a new R chunk (or the console) and run it now.
+## ---------------------------------------------------------------------------
+renviron_path <- path.expand("~/.Renviron")
+
+message("Before:")
+print(readLines(renviron_path))
+
+lines <- readLines(renviron_path)
+lines_clean <- lines[!grepl("^TIGRIS_CACHE_DIR", lines)]
+writeLines(lines_clean, renviron_path)
+
+message("After:")
+print(readLines(renviron_path))
+## You should now see ONLY the CENSUS_API_KEY line remaining.
+
+## ---------------------------------------------------------------------------
+## STEP 2: Verify both fixes took effect, in this fresh session
+## ---------------------------------------------------------------------------
+message("tempdir(): ", tempdir())
+message("TMPDIR env: '", Sys.getenv("TMPDIR"), "'")
+message("TIGRIS_CACHE_DIR env: '", Sys.getenv("TIGRIS_CACHE_DIR"), "'")
+
+if (grepl("ESTsoft", tempdir())) {
+  message("STILL BROKEN: tempdir() still points to ESTsoft. TMPDIR was not removed, or RStudio wasn't fully restarted.")
+} else {
+  message("OK: tempdir() looks clean.")
+}
+
+if (grepl("OneDrive", Sys.getenv("TIGRIS_CACHE_DIR"))) {
+  message("STILL BROKEN: TIGRIS_CACHE_DIR still points to OneDrive. Re-check ~/.Renviron.")
+} else {
+  message("OK: TIGRIS_CACHE_DIR looks clean.")
+}
+```
+
+
+```{r eval=FALSE, include=FALSE}
+## ---------------------------------------------------------------------------
+## 2. Download ACTUAL block group polygons — with retry for only failed states
+## ---------------------------------------------------------------------------
+options(timeout = 300)  # avoid spurious timeouts on slow connections
+
+fetch_one_state <- function(st) {
+  message("  Fetching state: ", st)
+  out <- tryCatch(
+    block_groups(state = st, year = 2017, progress_bar = FALSE) %>%
+      select(GEOID) %>%
+      mutate(state_fips = st),   # keep track of which state this came from
+    error = function(e) {
+      message("    FAILED for state ", st, ": ", conditionMessage(e))
+      NULL
+    }
+  )
+  message("    -> rows: ", if (is.null(out)) 0 else nrow(out))
+  out
+}
+
+## First pass — attempt all states
+bg_list <- setNames(lapply(state_codes, fetch_one_state), state_codes)
+
+## Identify which states failed (returned NULL)
+failed_states <- names(bg_list)[sapply(bg_list, is.null)]
+message("States failed on first pass: ", paste(failed_states, collapse = ", "))
+
+## Retry ONLY the failed ones (up to 2 more passes)
+retry_count <- 0
+while (length(failed_states) > 0 && retry_count < 2) {
+  retry_count <- retry_count + 1
+  message("--- Retry pass ", retry_count, " for: ", paste(failed_states, collapse = ", "), " ---")
+
+  retry_results <- setNames(lapply(failed_states, fetch_one_state), failed_states)
+  bg_list[failed_states] <- retry_results
+
+  failed_states <- names(bg_list)[sapply(bg_list, is.null)]
+}
+
+if (length(failed_states) > 0) {
+  warning("Still failed after retries: ", paste(failed_states, collapse = ", "))
+}
+
+## Combine all successful results
+bg_poly_sf <- bind_rows(bg_list[!sapply(bg_list, is.null)])
+
+if (nrow(bg_poly_sf) == 0) {
+  stop("bg_poly_sf is empty — no states downloaded successfully. ",
+       "Check tempdir()/TIGRIS_CACHE_DIR before continuing.")
+}
+
+message("Total BG polygons downloaded across all states: ", nrow(bg_poly_sf))
+```
+
+
+```{r}
+## ---------------------------------------------------------------------------
+## 2. Download ACTUAL block group polygons (no st_centroid!) and buffer 100 m
+##    Buffering once per unique GEOID is far cheaper than per-trip.
+## ---------------------------------------------------------------------------
+all_geoids  <- union(hhctbg_geo$home_geoid, tripctbg_geo$dest_geoid)
+state_codes <- unique(substr(all_geoids, 1, 2))
+
+message("Downloading Census BG polygons for ", length(state_codes), " states ...")
+
+## 1. Set clean local cache BEFORE downloading
+local_cache <- "C:/tigris_cache"
+dir.create(local_cache, showWarnings = FALSE)
+options(tigris_use_cache = TRUE, tigris_cache_dir = local_cache)
+
+## 2. Confirm settings took
+getOption("tigris_use_cache")
+getOption("tigris_cache_dir")
+
+Sys.getenv("http_proxy")
+Sys.getenv("https_proxy")
+
+## 3. Now run (or rerun) the download loop — first run still hits network,
+##    but every future rerun in this or future sessions will be fast
+bg_poly_sf <- map_dfr(state_codes, function(st) {
+  message("  Fetching state: ", st)
+  out <- tryCatch(
+    block_groups(state = st, year = 2017, progress_bar = FALSE) %>%
+      select(GEOID),
+    error = function(e) {
+      message("    FAILED for state ", st, ": ", conditionMessage(e))
+      NULL
+    }
+  )
+  message("    -> rows: ", if (is.null(out)) 0 else nrow(out))
+  out
+})
+
+if (nrow(bg_poly_sf) == 0) {
+  stop("bg_poly_sf is empty — no states downloaded successfully. ",
+       "Check tempdir()/TMPDIR before continuing.")
+}
+
+message("Total BG polygons downloaded across all states: ", nrow(bg_poly_sf))
+```
+
+
+```{r}
+## Define the projected CRS (NAD83 / Conus Albers, metres, equal area)
+CRS_PROJ <- 5070
+
+bg_poly_matched <- bg_poly_sf %>%
+  filter(GEOID %in% all_geoids) %>%
+  st_transform(CRS_PROJ)          # project BEFORE buffering
+
+message("BG polygons matched: ", nrow(bg_poly_matched), " of ", length(all_geoids))
+
+## Buffer the actual polygon boundary by 100 m (same distance for home & dest)
+bg_buffered <- bg_poly_matched %>%
+  mutate(geometry = st_buffer(geometry, dist = 100)) %>%
+  st_make_valid()
+
+## Lookup table: GEOID -> buffered polygon geometry, for fast joining
+bg_buf_lookup <- bg_buffered %>%
+  select(GEOID) %>%
+  distinct(GEOID, .keep_all = TRUE)
+
+bg_poly_matched <- bg_poly_sf %>%
+  filter(GEOID %in% all_geoids) %>%
+  st_transform(CRS_PROJ)          # CRS_PROJ <- 5070, project BEFORE buffering
+
+message("BG polygons matched: ", nrow(bg_poly_matched), " of ", length(all_geoids))
+
+## Buffer the actual polygon boundary by 100 m (same distance for home & dest)
+bg_buffered <- bg_poly_matched %>%
+  mutate(geometry = st_buffer(geometry, dist = 100)) %>%
+  st_make_valid()
+
+## Lookup table: GEOID -> buffered polygon geometry, for fast joining
+bg_buf_lookup <- bg_buffered %>%
+  select(GEOID) %>%
+  distinct(GEOID, .keep_all = TRUE)
+```
+
+
+```{r}
+## ---------------------------------------------------------------------------
+## 3. Assemble the set of GEOIDs visited per person-day (home + all dest stops)
+## ---------------------------------------------------------------------------
+person_home_geoid <- hhctbg_geo   # HOUSEID -> home_geoid
+
+person_dest_geoids <- trip_core_cmp %>%
+  select(HOUSEID, PERSONID, TDTRPNUM) %>%
+  left_join(tripctbg_geo, by = c("HOUSEID", "PERSONID", "TDTRPNUM")) %>%
+  filter(!is.na(dest_geoid)) %>%
+  distinct(HOUSEID, PERSONID, dest_geoid)   # dedup: repeat visits to same BG
+
+person_day_geoids <- person_dest_geoids %>%
+  rename(geoid = dest_geoid) %>%
+  bind_rows(
+    trip_core_cmp %>%
+      distinct(HOUSEID, PERSONID) %>%
+      left_join(person_home_geoid, by = "HOUSEID") %>%
+      rename(geoid = home_geoid) %>%
+      filter(!is.na(geoid))
+  ) %>%
+  distinct(HOUSEID, PERSONID, geoid)
+
+message("Person-days to process: ",
+        n_distinct(paste(person_day_geoids$HOUSEID, person_day_geoids$PERSONID)))
+```
+
+
+```{r eval=FALSE, include=FALSE}
+## ---------------------------------------------------------------------------
+## 4. Compute daily MCP area — vectorized version (no group_modify)
+## ---------------------------------------------------------------------------
+
+## 4a. Attach buffered geometry directly to each person-day-geoid row
+##     (left_join with an sf table returns an sf object automatically —
+##      no need to call st_as_sf() again)
+person_day_sf <- person_day_geoids %>%
+  left_join(bg_buf_lookup, by = c("geoid" = "GEOID")) %>%
+  st_as_sf()   # geometry column already exists (named "geometry" from bg_buf_lookup)
+
+message("Rows before geometry match: ", nrow(person_day_geoids))
+message("Rows with missing geometry: ", sum(st_is_empty(person_day_sf)))
+
+person_day_sf <- person_day_sf %>%
+  filter(!st_is_empty(person_day_sf))
+
+## ---------------------------------------------------------------------------
+## 4b. Combine (not union/dissolve) buffered polygons per person-day
+##     do_union = FALSE just concatenates geometries — convex hull result
+##     is identical either way, since the hull ignores overlaps anyway.
+## ---------------------------------------------------------------------------
+daily_union <- person_day_sf %>%
+  group_by(HOUSEID, PERSONID) %>%
+  summarise(.groups = "drop", do_union = FALSE)
+
+## 4c. Convex hull + area — vectorized over the whole sfc column at once
+daily_spaces <- daily_union %>%
+  mutate(
+    geometry           = st_convex_hull(geometry),
+    activity_space_km2 = as.numeric(st_area(geometry)) / 1e6
+  ) %>%
+  st_drop_geometry()
+
+message("Daily activity spaces computed: ", nrow(daily_spaces))
+```
+
+
+```{r}
+## ---------------------------------------------------------------------------
+## 4. Compute daily MCP area: union of buffered BG polygons -> convex hull
+## ---------------------------------------------------------------------------
+compute_daily_mcp_area <- function(geoid_vec) {
+  polys <- bg_buf_lookup %>% filter(GEOID %in% geoid_vec)
+  if (nrow(polys) == 0) return(NA_real_)
+
+  unioned <- st_union(polys)
+  mcp     <- st_convex_hull(unioned)
+  as.numeric(st_area(mcp)) / 1e6   # km^2
+}
+
+message("Computing daily activity spaces ...")
+
+daily_spaces <- person_day_geoids %>%
+  group_by(HOUSEID, PERSONID) %>%
+  group_modify(~ tibble(
+    activity_space_km2 = compute_daily_mcp_area(.x$geoid)
+  )) %>%
+  ungroup()
+```
+
+
+```{r}
+## ---------------------------------------------------------------------------
+## 4b. Assemble daily-level model dataset with controls + group label
+## ---------------------------------------------------------------------------
+day_summary <- trip_core_cmp %>%
+  group_by(HOUSEID, PERSONID) %>%
+  summarise(
+    n_tours      = n_distinct(paste(HOUSEID, PERSONID)),  # placeholder if you keep tour_id upstream
+    n_trips      = n(),
+    weekend      = any(TDWKND == "02", na.rm = TRUE),
+    age          = as.integer(first(R_AGE_IMP)),
+    female       = first(R_SEX_IMP) == "02",
+    driver       = first(DRIVER) == "01",
+    worker       = first(WORKER) == "01",
+    veh_cnt      = as.integer(first(HHVEHCNT)),
+    no_vehicle   = first(HHVEHCNT) == "0",
+    hh_size      = as.integer(first(HHSIZE)),
+    n_adults     = as.integer(first(NUMADLT)),
+    income_cat   = first(HHFAMINC),
+    lif_cyc      = first(LIF_CYC),
+    urbrur       = first(URBRUR),
+    msacat       = first(MSACAT),
+    wt_trip      = first(WTTRDFIN),
+    child_group  = first(child_group),
+    .groups = "drop"
+  ) %>%
+  left_join(daily_spaces, by = c("HOUSEID", "PERSONID")) %>%
+  filter(!is.na(activity_space_km2)) %>%
+  mutate(log_as_km2 = log(activity_space_km2))
+
+message("Final daily model dataset: ", nrow(day_summary), " person-days")
+day_summary %>% count(child_group)
+```
+
+```{r}
+## ---------------------------------------------------------------------------
+## 4c. Resample: URBAN only, home & ALL destination BGs <= 10 km^2
+##     Excludes the ENTIRE person-day if the home OR any single destination
+##     BG exceeds 10 km^2 — not trimming/capping the polygon, dropping the case.
+## ---------------------------------------------------------------------------
+
+## Check dependencies exist before rebuilding
+exists("bg_poly_matched")
+
+## Rebuild bg_area if missing
+if (!exists("bg_area")) {
+  bg_area <- bg_poly_matched %>%
+    mutate(
+      area_km2   = as.numeric(st_area(geometry)) / 1e6,
+      state_fips = substr(GEOID, 1, 2)
+    ) %>%
+    st_drop_geometry()
+}
+
+message("bg_area rows: ", nrow(bg_area))
+
+## Home BG area + urbanicity, per household
+home_info <- hhctbg_geo %>%
+  left_join(bg_area %>% select(GEOID, area_km2), by = c("home_geoid" = "GEOID")) %>%
+  rename(home_area_km2 = area_km2) %>%
+  left_join(day_summary %>% distinct(HOUSEID, urbrur), by = "HOUSEID")
+
+## Max destination BG area visited, per person-day
+dest_max_area <- person_day_geoids %>%
+  left_join(bg_area %>% select(GEOID, area_km2), by = c("geoid" = "GEOID")) %>%
+  group_by(HOUSEID, PERSONID) %>%
+  summarise(max_dest_area_km2 = max(area_km2, na.rm = TRUE), .groups = "drop")
+
+## Build the eligibility flag per person-day
+eligible_person_days <- daily_spaces %>%
+  left_join(home_info %>% select(HOUSEID, home_area_km2, urbrur), by = "HOUSEID") %>%
+  left_join(dest_max_area, by = c("HOUSEID", "PERSONID")) %>%
+  mutate(
+    eligible = !is.na(urbrur) & urbrur == "01" &
+      !is.na(home_area_km2) & home_area_km2 <= 10 &
+      !is.na(max_dest_area_km2) & max_dest_area_km2 <= 10
+  )
+
+message("Person-days before resampling: ", nrow(eligible_person_days))
+message("Person-days excluded — not urban: ",
+        sum(!is.na(eligible_person_days$urbrur) & eligible_person_days$urbrur != "01"))
+message("Person-days excluded — home BG > 10 km^2: ",
+        sum(eligible_person_days$home_area_km2 > 10, na.rm = TRUE))
+message("Person-days excluded — any destination BG > 10 km^2: ",
+        sum(eligible_person_days$max_dest_area_km2 > 10, na.rm = TRUE))
+
+## Apply the filter — drop the WHOLE person-day if any condition fails
+daily_spaces_resampled <- eligible_person_days %>%
+  filter(eligible) %>%
+  select(-eligible, -urbrur, -home_area_km2, -max_dest_area_km2)
+
+message("Person-days retained after urban + <=10km^2 resampling: ",
+        nrow(daily_spaces_resampled))
+```
+
+
+```{r}
+## ---------------------------------------------------------------------------
+## 5. Outlier exclusion (same 8-SD rule as original) — run on the RESAMPLED (urban, <=10km^2) data
+## ---------------------------------------------------------------------------
+message("Person-days entering outlier check: ", nrow(daily_spaces_resampled))
+
+as_mean <- mean(daily_spaces_resampled$activity_space_km2, na.rm = TRUE)
+as_sd   <- sd(daily_spaces_resampled$activity_space_km2,   na.rm = TRUE)
+
+message("Mean activity space: ", round(as_mean, 2), " km^2, SD: ", round(as_sd, 2))
+message("8-SD threshold: ", round(as_mean + 8 * as_sd, 2), " km^2")
+
+daily_spaces_resampled <- daily_spaces_resampled %>%
+  filter(
+    !is.na(activity_space_km2),
+    activity_space_km2 <= as_mean + 8 * as_sd
+  )
+
+message("Person-days retained after outlier exclusion: ", nrow(daily_spaces_resampled))
+```
+
+```{r}
+## Check whether extreme outliers still exist after your other restrictions
+daily_spaces_resampled %>%
+  summarise(
+    n = n(),
+    mean_as  = mean(activity_space_km2),
+    median_as = median(activity_space_km2),
+    sd_as    = sd(activity_space_km2),
+    max_as   = max(activity_space_km2),
+    p99_as   = quantile(activity_space_km2, 0.99)
+  )
+```
+
+
+```{r}
+## ---------------------------------------------------------------------------
+## 6. [New] Assemble daily-level model dataset with controls + group label
+## ---------------------------------------------------------------------------
+day_summary <- trip_core_cmp %>%
+  group_by(HOUSEID, PERSONID) %>%
+  summarise(
+    n_trips      = n(),
+    weekend      = any(TDWKND == "01", na.rm = TRUE),
+    age          = as.integer(first(R_AGE_IMP)),
+    female       = first(R_SEX_IMP) == "02",
+    driver       = first(DRIVER) == "01",
+    worker       = first(WORKER) == "01",
+    veh_cnt      = as.integer(first(HHVEHCNT)),
+    no_vehicle   = first(HHVEHCNT) == "0",
+    hh_size      = as.integer(first(HHSIZE)),
+    n_adults     = as.integer(first(NUMADLT)),
+    income_cat   = first(HHFAMINC),
+    lif_cyc      = first(LIF_CYC),
+    urbrur       = first(URBRUR),
+    msacat       = first(MSACAT),
+    wt_trip      = first(WTTRDFIN),
+    child_group  = first(child_group),
+    .groups = "drop"
+  )
+
+message("After trip_core_cmp summarise: ", nrow(day_summary), " person-rows")
+
+day_summary <- day_summary %>%
+  left_join(daily_spaces_resampled, by = c("HOUSEID", "PERSONID"))
+
+message("After joining daily_spaces_resampled: ", nrow(day_summary), " rows")
+message("  (compare to pre-join count above — if this is LARGER, you have duplicate-key fan-out)")
+
+day_summary <- day_summary %>%
+  filter(!is.na(activity_space_km2))
+
+message("After filtering NA activity_space_km2: ", nrow(day_summary), " rows")
+
+day_summary %>% count(child_group)
+
+## NOW immediately check nrow — no other chunks run in between
+message("nrow(day_summary) right now: ", nrow(day_summary))
+
+day_summary <- day_summary %>%
+  mutate(log_as_km2 = log(activity_space_km2))
+
+message("log_as_km2 added. Columns now: ", paste(names(day_summary), collapse = ", "))
+```
+
+
+
+
+## ---------------------------------------------------------------------------
+## ### Descriptive Stats
+##
+## constrains weekday vs. weekend activity spaces differently
+## (motivated by the Granada paper's weekday/weekend divergence finding)
+## ---------------------------------------------------------------------------
+
+```{r}
+## =============================================================================
+## 1. Recode HHFAMINC into income quartiles (drop refused/don't know)
+## =============================================================================
+
+## NHTS 2017 HHFAMINC codes: 01-11 are ordered income brackets;
+## -7 = refused, -8 = don't know, -9 = not ascertained -> all treated as missing
+
+n_before_income_filter <- nrow(day_summary)
+
+day_summary <- day_summary %>%
+  mutate(
+    income_num = as.integer(income_cat),
+    income_num = if_else(income_num %in% c(-7, -8, -9), NA_integer_, income_num)
+  )
+
+n_missing_income <- sum(is.na(day_summary$income_num))
+
+day_summary <- day_summary %>%
+  filter(!is.na(income_num))   # drop refused/don't know/not ascertained
+
+message("Rows before income filtering: ", n_before_income_filter)
+message("Rows dropped (refused/don't know/not ascertained): ", n_missing_income)
+message("Rows after dropping missing/refused income: ", nrow(day_summary))
+
+## Breakdown of dropped codes, run BEFORE the filter() line
+day_summary %>%
+  mutate(income_num_raw = as.integer(income_cat)) %>%
+  filter(income_num_raw %in% c(-7, -8, -9)) %>%
+  count(income_num_raw) %>%
+  mutate(label = case_when(
+    income_num_raw == -7 ~ "Refused",
+    income_num_raw == -8 ~ "Don't know",
+    income_num_raw == -9 ~ "Not ascertained"
+  ))
+
+## Quartile the ORDINAL income category (not dollar values, since HHFAMINC
+## is a categorical bracket, not a continuous income figure)
+day_summary <- day_summary %>%
+  mutate(
+    income_quartile = ntile(income_num, 4),
+    income_quartile = factor(
+      income_quartile,
+      levels = 1:4,
+      labels = c("Q1_lowest", "Q2", "Q3", "Q4_highest")
+    )
+  )
+
+table(day_summary$income_quartile, useNA = "ifany")
+
+## Rebuild weekend from trip_core_cmp directly, with the CORRECT TDWKND mapping,
+## then convert to factor exactly once
+weekend_lookup <- trip_core_cmp %>%
+  group_by(HOUSEID, PERSONID) %>%
+  summarise(
+    weekend_logical = any(TDWKND == "01", na.rm = TRUE),  # '01' = weekend, confirmed
+    .groups = "drop"
+  )
+
+day_summary <- day_summary %>%
+  mutate(
+    msacat  = factor(msacat),
+    weekend = if (is.logical(weekend)) {
+      factor(weekend, levels = c(FALSE, TRUE), labels = c("weekday", "weekend"))
+    } else {
+      weekend
+    }
+  )
+
+## Verify before proceeding to any models
+class(day_summary$weekend)
+table(day_summary$weekend, useNA = "ifany")
+```
+
+
+```{r}
+## =============================================================================
+## 2. Descriptive statistics
+## =============================================================================
+
+## 2a. Overall descriptives by child_group
+desc_by_group <- day_summary %>%
+  group_by(child_group) %>%
+  summarise(
+    n                    = n(),
+    mean_activity_km2    = mean(activity_space_km2, na.rm = TRUE),
+    median_activity_km2  = median(activity_space_km2, na.rm = TRUE),
+    sd_activity_km2      = sd(activity_space_km2, na.rm = TRUE),
+    mean_log_as          = mean(log_as_km2, na.rm = TRUE),
+    mean_age             = mean(age, na.rm = TRUE),
+    pct_female           = mean(female, na.rm = TRUE),
+    pct_worker           = mean(worker, na.rm = TRUE),
+    pct_no_vehicle       = mean(no_vehicle, na.rm = TRUE),
+    mean_hh_size         = mean(hh_size, na.rm = TRUE),
+    mean_n_adults        = mean(n_adults, na.rm = TRUE),
+    pct_weekend          = mean(weekend, na.rm = TRUE),
+    pct_urban            = mean(urbrur == "01", na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(desc_by_group)
+```
+
+```{r}
+## 2b. Income quartile distribution by group (check balance)
+income_by_group <- day_summary %>%
+  count(child_group, income_quartile) %>%
+  group_by(child_group) %>%
+  mutate(pct = n / sum(n)) %>%
+  ungroup()
+
+print(income_by_group)
+```
+
+```{r}
+## 2c. Activity space by group AND weekday/weekend (for the interaction question)
+desc_by_group_weekend <- day_summary %>%
+  group_by(child_group, weekend) %>%
+  summarise(
+    n                 = n(),
+    mean_activity_km2 = mean(activity_space_km2, na.rm = TRUE),
+    mean_log_as       = mean(log_as_km2, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(desc_by_group_weekend)
+
+## Check the raw TDWKND distribution before your weekend recoding
+table(trip_core_cmp$TDWKND, useNA = "ifany")
+
+## Cross-check: does this match what NHTS documentation says TDWKND codes mean?
+## (01 = weekend, 02 = weekday is the assumption in your code — verify this)
+```
+
+
+
+
+## ---------------------------------------------------------------------------
+## ### Regression models (OLS)
+##
+## constrains weekday vs. weekend activity spaces differently
+## (motivated by the Granada paper's weekday/weekend divergence finding)
+## ---------------------------------------------------------------------------
+
+```{r}
+## Rebuild weekend AGAIN from raw TDWKND — this restores real values,
+## the guard alone cannot recover already-NA'd data
+weekend_lookup <- trip_core_cmp %>%
+  group_by(HOUSEID, PERSONID) %>%
+  summarise(
+    weekend_logical = any(TDWKND == "01", na.rm = TRUE),
+    .groups = "drop"
+  )
+
+day_summary <- day_summary %>%
+  select(-weekend) %>%
+  left_join(weekend_lookup, by = c("HOUSEID", "PERSONID")) %>%
+  mutate(
+    weekend = factor(weekend_logical, levels = c(FALSE, TRUE), labels = c("weekday", "weekend"))
+  ) %>%
+  select(-weekend_logical)
+
+message("Rebuilt weekend distribution:")
+table(day_summary$weekend, useNA = "ifany")
+## Should show weekday >> weekend again, NOT all NA
+```
+
+```{r}
+## 1. Rebuild day_summary from scratch (section 6), exactly as your pipeline defines it
+day_summary <- trip_core_cmp %>%
+  group_by(HOUSEID, PERSONID) %>%
+  summarise(
+    n_trips      = n(),
+    weekend      = any(TDWKND == "01", na.rm = TRUE),   # CORRECT mapping, fixed here directly
+    age          = as.integer(first(R_AGE_IMP)),
+    female       = first(R_SEX_IMP) == "02",
+    driver       = first(DRIVER) == "01",
+    worker       = first(WORKER) == "01",
+    veh_cnt      = as.integer(first(HHVEHCNT)),
+    no_vehicle   = first(HHVEHCNT) == "0",
+    hh_size      = as.integer(first(HHSIZE)),
+    n_adults     = as.integer(first(NUMADLT)),
+    income_cat   = first(HHFAMINC),
+    lif_cyc      = first(LIF_CYC),
+    urbrur       = first(URBRUR),
+    msacat       = first(MSACAT),
+    wt_trip      = first(WTTRDFIN),
+    child_group  = first(child_group),
+    .groups = "drop"
+  ) %>%
+  left_join(daily_spaces_resampled, by = c("HOUSEID", "PERSONID")) %>%
+  filter(!is.na(activity_space_km2)) %>%
+  mutate(log_as_km2 = log(activity_space_km2))
+
+class(day_summary$weekend)
+table(day_summary$weekend, useNA = "ifany")
+```
+
+```{r}
+## ---------------------------------------------------------------------------
+## Re-apply income quartile recoding (on the freshly rebuilt day_summary)
+## ---------------------------------------------------------------------------
+n_before_income_filter <- nrow(day_summary)
+
+day_summary <- day_summary %>%
+  mutate(
+    income_num = as.integer(income_cat),
+    income_num = if_else(income_num %in% c(-7, -8, -9), NA_integer_, income_num)
+  )
+
+n_missing_income <- sum(is.na(day_summary$income_num))
+
+day_summary <- day_summary %>%
+  filter(!is.na(income_num))
+
+message("Rows before income filtering: ", n_before_income_filter)
+message("Rows dropped (refused/don't know/not ascertained): ", n_missing_income)
+message("Rows after dropping missing/refused income: ", nrow(day_summary))
+
+day_summary <- day_summary %>%
+  mutate(
+    income_quartile = ntile(income_num, 4),
+    income_quartile = factor(
+      income_quartile,
+      levels = 1:4,
+      labels = c("Q1_lowest", "Q2", "Q3", "Q4_highest")
+    )
+  )
+
+table(day_summary$income_quartile, useNA = "ifany")
+
+## ---------------------------------------------------------------------------
+## Re-apply factor conversions (msacat, weekend) — weekend is still a clean
+## logical at this point, so the guard will convert it correctly, once
+## ---------------------------------------------------------------------------
+day_summary <- day_summary %>%
+  mutate(
+    msacat  = factor(msacat),
+    weekend = if (is.logical(weekend)) {
+      factor(weekend, levels = c(FALSE, TRUE), labels = c("weekday", "weekend"))
+    } else {
+      weekend
+    }
+  )
+
+class(day_summary$weekend)
+table(day_summary$weekend, useNA = "ifany")
+```
+
+
+```{r}
+## =============================================================================
+## 3. Regression models (OLS)
+## =============================================================================
+
+## Model 1: main effect of child_group only (unadjusted)
+m1_unadjusted <- lm(
+  log_as_km2 ~ child_group,
+  data = day_summary
+)
+
+## Model 2: adjusted for demographic + household controls
+m2_adjusted <- lm(
+  log_as_km2 ~ child_group + age + female + worker + no_vehicle +
+    hh_size + n_adults + income_quartile + msacat,
+  data = day_summary
+)
+
+## Model 3: adjusted + weekend main effect (additive, same slope both days)
+m3_weekend_additive <- lm(
+  log_as_km2 ~ child_group + weekend + age + female + worker + no_vehicle +
+    hh_size + n_adults + income_quartile + msacat,
+  data = day_summary
+)
+
+## Model 4: child_group x weekend INTERACTION
+##   This is the model that answers your 4th bullet directly — it lets the
+##   child-presence effect on activity space differ between weekday and
+##   weekend, rather than assuming the same effect size applies to both.
+m4_weekend_interaction <- lm(
+  log_as_km2 ~ child_group * weekend + age + female + worker + no_vehicle +
+    hh_size + n_adults + income_quartile + msacat,
+  data = day_summary
+)
+
+## Compare models
+summary(m1_unadjusted)
+summary(m2_adjusted)
+summary(m3_weekend_additive)
+summary(m4_weekend_interaction)
+
+## Formal test: does allowing the interaction significantly improve fit
+## over the additive model? (i.e., does the child effect really differ
+## by weekday/weekend, or is the additive model sufficient?)
+anova(m3_weekend_additive, m4_weekend_interaction)
+```
+
+
+```{r}
+## =============================================================================
+## 4. Stratified models: weekday-only and weekend-only
+##    (alternative to the interaction term — run fully separate models
+##     so ALL coefficients, not just child_group, are allowed to differ)
+## =============================================================================
+
+m_weekday_only <- lm(
+  log_as_km2 ~ child_group + age + female + worker + no_vehicle +
+    hh_size + n_adults + income_quartile + msacat,
+  data = day_summary %>% filter(weekend == "weekday")
+)
+
+m_weekend_only <- lm(
+  log_as_km2 ~ child_group + age + female + worker + no_vehicle +
+    hh_size + n_adults + income_quartile + msacat,
+  data = day_summary %>% filter(weekend == "weekend")
+)
+
+summary(m_weekday_only)
+summary(m_weekend_only)
+```
+
+
+```{r}
+## Side-by-side comparison of the child_group coefficient across strata
+library(broom)
+bind_rows(
+  tidy(m_weekday_only) %>% mutate(sample = "weekday"),
+  tidy(m_weekend_only) %>% mutate(sample = "weekend")
+) %>%
+  filter(str_detect(term, "child_group")) %>%
+  select(sample, term, estimate, std.error, p.value)
+```
+
+
+
+
+
+
+
+
+
+
+
+
