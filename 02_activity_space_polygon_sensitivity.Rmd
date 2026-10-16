@@ -1,12 +1,13 @@
 ---
-title: "data_processing_3 (cleaned)"
-author: "dawon"
-date: "2026-07-14"
+title: "Caregiver Activity Spaces (NHTS 2017): block-group polygon sensitivity analysis"
+author: "Dawon Oh"
+date: "2026-07-23"
 output: html_document
 ---
 
 ### [Only urban area with 1 million or more with heavy rail (URBANSIZE == 05)] 
-### 5km2 CS cutoff + 100m buffer around polygon (without 8sd exclusion)
+### 10km2 cutoff + 100m buffer around polygon (without 8sd exclusion)
+### Activity space >=1000km2
 
 
 
@@ -31,6 +32,9 @@ library(tidyverse)
 library(sf)
 library(tigris)
 library(broom)
+library(sandwich)
+library(lmtest)
+library(here)
 
 options(tigris_use_cache = TRUE)
 
@@ -39,32 +43,10 @@ CRS_PROJ <- 5070  # NAD83 / Conus Albers, metres, equal-area
 
 ```{r paths}
 ## ---------------------------------------------------------------------------
-## 0. Paths — edit these
+## 0. Paths (relative to the project root)
 ## ---------------------------------------------------------------------------
-data_dir   <- "C:/Users/ohdaw/OneDrive/Documents/R_Projects/CaregiverActivitySpace/data"
-output_dir <- "C:/Users/ohdaw/OneDrive/Documents/R_Projects/CaregiverActivitySpace/results"
-```
-
-```{r one-time-env-fix, eval=FALSE}
-## ---------------------------------------------------------------------------
-## ONE-TIME MACHINE SETUP — not part of the analysis pipeline.
-## Run this by hand once (or whenever tigris starts throwing OneDrive/ESTsoft
-## path errors), then restart R. Do not knit this chunk as part of the report.
-## ---------------------------------------------------------------------------
-Sys.setenv(TMPDIR = "C:/Users/ohdaw/AppData/Local/Temp")
-
-renviron_path <- path.expand("~/.Renviron")
-lines         <- readLines(renviron_path)
-lines_clean   <- lines[!grepl("^TIGRIS_CACHE_DIR", lines)]
-writeLines(lines_clean, renviron_path)
-
-local_cache <- "C:/tigris_cache"
-dir.create(local_cache, showWarnings = FALSE)
-options(tigris_use_cache = TRUE, tigris_cache_dir = local_cache)
-
-message("tempdir(): ", tempdir())
-message("TIGRIS_CACHE_DIR: '", Sys.getenv("TIGRIS_CACHE_DIR"), "'")
-stopifnot(!grepl("ESTsoft|OneDrive", tempdir()))
+data_dir   <- here("data")
+output_dir <- here("results")
 ```
 
 ```{r load-nhts}
@@ -78,7 +60,7 @@ hhpub    <- read_csv(file.path(data_dir, "hhpub.csv"),   col_types = cols(.defau
 perpub   <- read_csv(file.path(data_dir, "perpub.csv"),  col_types = cols(.default = "c"))
 ```
 
-```{r msacat-filter}
+```{r URBANSIZE-filter}
 ## ---------------------------------------------------------------------------
 ## 1b. Restrict to MSACAT == "01" households only
 ##     (all columns were read in as character, so compare against "01",
@@ -271,6 +253,47 @@ tripctbg_geo <- tripctbg %>%
   )
 ```
 
+```{r geocode completeness check}
+## ---------------------------------------------------------------------------
+## 5b. Geocoding-completeness indicator (person-day level)
+## ---------------------------------------------------------------------------
+geo_completeness <- trip_core_cmp %>%
+  left_join(
+    tripctbg_geo,
+    by = c("HOUSEID", "PERSONID", "TDTRPNUM")
+  ) %>%
+  group_by(HOUSEID, PERSONID) %>%
+  summarise(
+    n_reported_trips   = n(),
+    n_geocoded_trips   = sum(!is.na(dest_geoid)),
+    all_trips_geocoded = n_reported_trips == n_geocoded_trips,
+    .groups = "drop"
+  )
+
+message(
+  "Person-days with ALL destinations geocoded: ",
+  sum(geo_completeness$all_trips_geocoded), " of ", nrow(geo_completeness),
+  " (", round(100 * mean(geo_completeness$all_trips_geocoded), 1), "%)"
+)
+
+## Keep the unrestricted trip-level frame for a later sensitivity analysis
+trip_core_full <- trip_core_cmp
+
+## PRIMARY analysis: require every reported trip to have geocoded successfully
+trip_core_cmp <- trip_core_cmp %>%
+  semi_join(
+    geo_completeness %>% filter(all_trips_geocoded),
+    by = c("HOUSEID", "PERSONID")
+  )
+
+message(
+  "Person-days retained for PRIMARY analysis (fully geocoded trips only): ",
+  n_distinct(paste(trip_core_cmp$HOUSEID, trip_core_cmp$PERSONID)),
+  " of ", n_distinct(paste(trip_core_full$HOUSEID, trip_core_full$PERSONID)),
+  " total person-days"
+)
+```
+
 ```{r download-bg-polygons}
 ## ---------------------------------------------------------------------------
 ## 6. Download block-group polygons (once) and buffer 100 m
@@ -291,7 +314,7 @@ bg_poly_sf <- map_dfr(state_codes, function(st) {
 })
 
 if (nrow(bg_poly_sf) == 0) {
-  stop("bg_poly_sf is empty — check tempdir()/TIGRIS_CACHE_DIR (see one-time-env-fix chunk).")
+  stop("bg_poly_sf is empty — no states downloaded successfully. Check the tigris cache/tempdir().")
 }
 message("Total BG polygons downloaded: ", nrow(bg_poly_sf))
 
@@ -311,6 +334,29 @@ bg_buf_lookup <- bg_poly_matched %>%
 bg_area <- bg_poly_matched %>%
   mutate(area_km2 = as.numeric(st_area(geometry)) / 1e6) %>%
   st_drop_geometry()
+```
+
+```{r check GEOID matches Tiger}
+## ---------------------------------------------------------------------------
+## 6b. Check whether every home and destination GEOID matched a TIGER polygon
+##     (unmatched GEOIDs silently produce NA activity-space areas downstream
+##     in compute_daily_mcp_area(), so surface them explicitly here)
+## ---------------------------------------------------------------------------
+unmatched_geoids <- setdiff(all_geoids, bg_poly_matched$GEOID)
+unmatched_home   <- intersect(unmatched_geoids, hhctbg_geo$home_geoid)
+unmatched_dest   <- intersect(unmatched_geoids, tripctbg_geo$dest_geoid)
+
+message(
+  "GEOIDs with NO matching TIGER/Line polygon: ", length(unmatched_geoids),
+  " of ", length(all_geoids)
+)
+message("  -> unmatched HOME geoids:        ", length(unmatched_home))
+message("  -> unmatched DESTINATION geoids: ", length(unmatched_dest))
+
+if (length(unmatched_geoids) > 0) {
+  message("Unmatched GEOIDs (first 20 shown):")
+  print(head(unmatched_geoids, 20))
+}
 ```
 
 ```{r person-day-geoids}
@@ -358,7 +404,7 @@ message("Daily activity spaces computed: ", nrow(daily_spaces))
 
 ```{r eligibility-resample}
 ## ---------------------------------------------------------------------------
-## 9. Resample: URBAN only, home & all destination BGs <= 20 km^2.
+## 9. Resample: URBAN only, home & all destination BGs <= 5 km^2.
 ##    Drops the ENTIRE person-day if home OR any single destination BG
 ##    exceeds 20 km^2 (no trimming/capping of the polygon itself).
 ## ---------------------------------------------------------------------------
@@ -370,15 +416,20 @@ home_info <- hhctbg_geo %>%
 dest_max_area <- person_day_geoids %>%
   left_join(bg_area %>% select(GEOID, area_km2), by = c("geoid" = "GEOID")) %>%
   group_by(HOUSEID, PERSONID) %>%
-  summarise(max_dest_area_km2 = max(area_km2, na.rm = TRUE), .groups = "drop")
+  summarise(
+  max_dest_area_km2 = if (
+    all(is.na(area_km2))
+  ) NA_real_ else max(area_km2, na.rm = TRUE),
+  .groups = "drop"
+)
 
 daily_spaces_resampled <- daily_spaces %>%
   left_join(home_info %>% select(HOUSEID, home_area_km2, URBRUR), by = "HOUSEID") %>%
   left_join(dest_max_area, by = c("HOUSEID", "PERSONID")) %>%
   mutate(
     eligible = !is.na(URBRUR) & URBRUR == "01" &
-      !is.na(home_area_km2) & home_area_km2 <= 5 &
-      !is.na(max_dest_area_km2) & max_dest_area_km2 <= 5
+      !is.na(home_area_km2) & home_area_km2 <= 10 &
+      !is.na(max_dest_area_km2) & max_dest_area_km2 <= 10
   ) %>%
   filter(eligible) %>%
   select(HOUSEID, PERSONID, activity_space_km2)
@@ -386,26 +437,23 @@ daily_spaces_resampled <- daily_spaces %>%
 message("Person-days retained after urban + <=20km^2 resampling: ", nrow(daily_spaces_resampled))
 ```
 
-```{r outlier-exclusion, eval=FALSE, include=FALSE}
+```{r outlier-exclusion}
 ## ---------------------------------------------------------------------------
 ## 10. Outlier exclusion: drop activity spaces beyond mean + 8*SD
 ## ---------------------------------------------------------------------------
-as_mean <- mean(daily_spaces_resampled$activity_space_km2, na.rm = TRUE)
-as_sd   <- sd(daily_spaces_resampled$activity_space_km2,   na.rm = TRUE)
-message("Mean: ", round(as_mean, 2), " km^2, SD: ", round(as_sd, 2),
-        ", 8-SD threshold: ", round(as_mean + 8 * as_sd, 2), " km^2")
+daily_spaces_resampled <- daily_spaces %>%
+  left_join(home_info %>% select(HOUSEID, home_area_km2, URBRUR), by = "HOUSEID") %>%
+  left_join(dest_max_area, by = c("HOUSEID", "PERSONID")) %>%
+  mutate(
+    eligible = !is.na(URBRUR) & URBRUR == "01" &
+      !is.na(home_area_km2) & home_area_km2 <= 5 &
+      !is.na(max_dest_area_km2) & max_dest_area_km2 <= 5 &
+      !is.na(activity_space_km2) & activity_space_km2  <= 1000
+  ) %>%
+  filter(eligible) %>%
+  select(HOUSEID, PERSONID, activity_space_km2)
 
-daily_spaces_resampled <- daily_spaces_resampled %>%
-  filter(!is.na(activity_space_km2), activity_space_km2 <= as_mean + 8 * as_sd)
-
-message("Retained after outlier exclusion: ", nrow(daily_spaces_resampled))
-
-daily_spaces_resampled %>%
-  summarise(
-    n = n(), mean_as = mean(activity_space_km2), median_as = median(activity_space_km2),
-    sd_as = sd(activity_space_km2), max_as = max(activity_space_km2),
-    p99_as = quantile(activity_space_km2, 0.99)
-  )
+message("Person-days retained after urban + area + activity-space filters: ", nrow(daily_spaces_resampled))
 ```
 
 ## ---------------------------------------------------------------------------
@@ -419,9 +467,30 @@ daily_spaces_resampled %>%
 ## ---------------------------------------------------------------------------
 ## 11. Final person-day model dataset (single build — no re-patching)
 ## ---------------------------------------------------------------------------
-income_quartile_recode <- function(income_cat) {
-  income_num <- as.integer(income_cat)
-  if_else(income_num %in% c(-7, -8, -9), NA_integer_, income_num)
+
+## ---------------------------------------------------------------------------
+## Recode HHFAMINC (11 ordered income bands) into an approximate continuous
+## dollar value using band midpoints. Refused/DK/not-ascertained (-7,-8,-9)
+## -> NA. The top band ("11" = $200,000+) is open-ended; NHTS provides no
+## true upper bound, so it's approximated here as 1.5x the band floor
+## ($300,000) -- a common convention for top-coded income bands. Adjust this
+## assumption if you have a better basis.
+## ---------------------------------------------------------------------------
+income_midpoint_recode <- function(income_cat) {
+  case_when(
+    income_cat == "01" ~ 5000,     # < $10,000
+    income_cat == "02" ~ 12500,    # $10,000-$14,999
+    income_cat == "03" ~ 20000,    # $15,000-$24,999
+    income_cat == "04" ~ 30000,    # $25,000-$34,999
+    income_cat == "05" ~ 42500,    # $35,000-$49,999
+    income_cat == "06" ~ 62500,    # $50,000-$74,999
+    income_cat == "07" ~ 87500,    # $75,000-$99,999
+    income_cat == "08" ~ 112500,   # $100,000-$124,999
+    income_cat == "09" ~ 137500,   # $125,000-$149,999
+    income_cat == "10" ~ 175000,   # $150,000-$199,999
+    income_cat == "11" ~ 300000,   # $200,000+ (open-ended, approximated)
+    TRUE               ~ NA_real_  # -7, -8, -9 = refused/DK/not ascertained
+  )
 }
 
 day_summary <- trip_core_cmp %>%
@@ -441,6 +510,7 @@ day_summary <- trip_core_cmp %>%
     lif_cyc     = first(LIF_CYC),
     urbrur      = first(URBRUR),
     msacat      = first(MSACAT),
+    HH_CBSA     = first(HH_CBSA),
     wt_trip     = first(WTTRDFIN),
     child_group = first(child_group),
     .groups = "drop"
@@ -449,21 +519,29 @@ day_summary <- trip_core_cmp %>%
   filter(!is.na(activity_space_km2)) %>%
   mutate(
     log_as_km2 = log(activity_space_km2),
-    income_num = income_quartile_recode(income_cat)
+    income_mid = income_midpoint_recode(income_cat),
+    log_income = log(income_mid)
   ) %>%
-  filter(!is.na(income_num)) %>%   # drop refused/don't know/not ascertained
+  filter(!is.na(income_mid)) %>%   # drop refused/don't know/not ascertained
   mutate(
-    income_quartile = ntile(income_num, 4),
+    income_quartile = ntile(income_mid, 4),
     income_quartile = factor(income_quartile, levels = 1:4,
                               labels = c("Q1_lowest", "Q2", "Q3", "Q4_highest")),
     msacat  = factor(msacat),
+    HH_CBSA = na_if(HH_CBSA, "XXXXX"),   # recode NHTS's non-CBSA/NA placeholder
+    HH_CBSA = factor(HH_CBSA),
     weekend = factor(weekend, levels = c(FALSE, TRUE), labels = c("weekday", "weekend"))
-  )
+  ) %>%
+  filter(!is.na(HH_CBSA))   # drop person-days with no valid CBSA assignment
 
 message("Final person-day dataset: ", nrow(day_summary), " rows")
 day_summary %>% count(child_group)
 table(day_summary$income_quartile, useNA = "ifany")
 table(day_summary$weekend, useNA = "ifany")
+
+# Run once, before finalizing, to see what codes actually show up
+trip_core_cmp %>% count(HH_CBSA, sort = TRUE) %>% print(n = 30)
+message("Final day_summary N (after CBSA restriction): ", nrow(day_summary))
 ```
 
 ## ---------------------------------------------------------------------------
@@ -514,13 +592,15 @@ m1_unadjusted <- lm(log_as_km2 ~ child_group, data = day_summary)
 
 m2_adjusted <- lm(
   log_as_km2 ~ child_group + age + female + worker + no_vehicle +
-    hh_size + n_adults + income_quartile,
+    #hh_size + 
+    n_adults + income_quartile ,
   data = day_summary
 )
 
 m3_weekend_additive <- lm(
   log_as_km2 ~ child_group + weekend + age + female + worker + no_vehicle +
-    hh_size + n_adults + income_quartile,
+    #hh_size + 
+    n_adults + income_quartile ,
   data = day_summary
 )
 
@@ -528,7 +608,8 @@ m3_weekend_additive <- lm(
 ## activity space differ between weekday and weekend
 m4_weekend_interaction <- lm(
   log_as_km2 ~ child_group * weekend + age + female + worker + no_vehicle +
-    hh_size + n_adults + income_quartile,
+    #hh_size + 
+    n_adults + income_quartile ,
   data = day_summary
 )
 
@@ -539,6 +620,27 @@ summary(m4_weekend_interaction)
 
 ## Does the interaction significantly improve fit over the additive model?
 anova(m3_weekend_additive, m4_weekend_interaction)
+
+## Some households contribute more than one adult. Their activity spaces, income, vehicle access, residential location, and family structure are correlated. Standard OLS standard errors will generally be too optimistic. Use household-clustered standard errors:
+coeftest(
+  m1_unadjusted,
+  vcov = vcovCL(m1_unadjusted, cluster = ~ HOUSEID)
+)
+
+coeftest(
+  m2_adjusted,
+  vcov = vcovCL(m2_adjusted, cluster = ~ HOUSEID)
+)
+
+coeftest(
+  m3_weekend_additive,
+  vcov = vcovCL(m3_weekend_additive, cluster = ~ HOUSEID)
+)
+
+coeftest(
+  m4_weekend_interaction,
+  vcov = vcovCL(m4_weekend_interaction, cluster = ~ HOUSEID)
+)
 ```
 
 ```{r stratified-models}
@@ -548,17 +650,22 @@ anova(m3_weekend_additive, m4_weekend_interaction)
 ## ---------------------------------------------------------------------------
 m_weekday_only <- lm(
   log_as_km2 ~ child_group + age + female + worker + no_vehicle +
-    hh_size + n_adults + income_quartile,
+    #hh_size + 
+    n_adults + income_quartile ,
   data = day_summary %>% filter(weekend == "weekday")
 )
 
 m_weekend_only <- lm(
   log_as_km2 ~ child_group + age + female + worker + no_vehicle +
-    hh_size + n_adults + income_quartile,
+    #hh_size + 
+    n_adults + income_quartile ,
   data = day_summary %>% filter(weekend == "weekend")
 )
 
 summary(m_weekday_only)
+
+
+
 summary(m_weekend_only)
 
 bind_rows(
@@ -567,161 +674,17 @@ bind_rows(
 ) %>%
   filter(str_detect(term, "child_group")) %>%
   select(sample, term, estimate, std.error, p.value)
-```
 
-
-
-
-```{r}
-## =============================================================================
-## Distribution of activity space area (km^2) — raw scale
-## =============================================================================
-
-ggplot(day_summary, aes(x = activity_space_km2)) +
-  geom_histogram(bins = 60) +
-  labs(
-    title = "Distribution of Daily Activity Space Area",
-    x = "Activity space area (km^2)",
-    y = "Count"
-  ) +
-  theme_minimal()
-
-## Given the skew you've seen throughout this analysis, a log-scale version
-## will likely be more interpretable:
-ggplot(day_summary, aes(x = activity_space_km2)) +
-  geom_histogram(bins = 60) +
-  scale_x_log10() +
-  labs(
-    title = "Distribution of Daily Activity Space Area (log scale)",
-    x = "Activity space area (km^2, log scale)",
-    y = "Count"
-  ) +
-  theme_minimal()
-
-## Split by child_group, to visually compare the two groups directly
-ggplot(day_summary, aes(x = activity_space_km2, fill = child_group)) +
-  geom_histogram(bins = 60, alpha = 0.6, position = "identity") +
-  scale_x_log10() +
-  labs(
-    title = "Activity Space Area by Household Type",
-    x = "Activity space area (km^2, log scale)",
-    y = "Count",
-    fill = "Household type"
-  ) +
-  theme_minimal()
-
-## Alternative: boxplot, often clearer than overlapping histograms for
-## comparing two groups' distributions (including median, IQR, outliers)
-ggplot(day_summary, aes(x = child_group, y = activity_space_km2, fill = child_group)) +
-  geom_boxplot() +
-  scale_y_log10() +
-  labs(
-    title = "Activity Space Area by Household Type",
-    x = "Household type",
-    y = "Activity space area (km^2, log scale)"
-  ) +
-  theme_minimal() +
-  theme(legend.position = "none")
-```
-
-```{r}
-## Zoomed-in raw-scale histogram, focused on the lower range
-ggplot(day_summary, aes(x = activity_space_km2)) +
-  geom_histogram(bins = 1000) +
-  coord_cartesian(xlim = c(0, 1000)) +   # <-- adjust upper bound as needed
-  labs(
-    title = "Distribution of Daily Activity Space Area (zoomed, 0-5 km^2)",
-    x = "Activity space area (km^2)",
-    y = "Count"
-  ) +
-  theme_minimal()
-
-#--------------------------------------------------------------------------------
-
-coord_cartesian(xlim = c(0, 1000000))
-
-quantile(day_summary$activity_space_km2, probs = c(0.5, 0.75, 0.9, 0.95, 0.99, 1), na.rm = TRUE)
-
-ggplot(day_summary, aes(x = activity_space_km2, fill = child_group)) +
-  geom_histogram(bins = 1000, alpha = 0.6, position = "identity") +
-  coord_cartesian(xlim = c(0, 5)) +
-  labs(
-    title = "Activity Space Area by Household Type (zoomed, 0-5 km^2)",
-    x = "Activity space area (km^2)",
-    y = "Count",
-    fill = "Household type"
-  ) +
-  theme_minimal()
-```
-
-```{r}
-## =============================================================================
-## Table version: activity space area distribution, binned
-## =============================================================================
-
-## 1. Simple bin table (fixed-width bins from 0 to a chosen upper bound)
-day_summary %>%
-  mutate(
-    area_bin = cut(
-      activity_space_km2,
-      breaks = seq(0, 5, by = 0.5),   # adjust range/width as needed
-      include.lowest = TRUE
-    )
-  ) %>%
-  count(area_bin) %>%
-  mutate(pct = round(n / sum(n) * 100, 2))
-
-## 2. Same binning, but split by child_group side by side
-day_summary %>%
-  mutate(
-    area_bin = cut(
-      activity_space_km2,
-      breaks = seq(0, 5, by = 0.5),
-      include.lowest = TRUE
-    )
-  ) %>%
-  count(child_group, area_bin) %>%
-  group_by(child_group) %>%
-  mutate(pct = round(n / sum(n) * 100, 2)) %>%
-  ungroup() %>%
-  tidyr::pivot_wider(names_from = child_group, values_from = c(n, pct))
-
-## 3. Percentile table (often more informative than fixed bins for skewed data)
-quantile(
-  day_summary$activity_space_km2,
-  probs = c(0, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 1),
-  na.rm = TRUE
+coeftest(
+  m_weekday_only,
+  vcov = vcovCL(m_weekday_only, cluster = ~ HOUSEID)
 )
 
-## 4. Percentile table split by child_group
-day_summary %>%
-  group_by(child_group) %>%
-  summarise(
-    p0   = quantile(activity_space_km2, 0, na.rm = TRUE),
-    p5   = quantile(activity_space_km2, 0.05, na.rm = TRUE),
-    p10  = quantile(activity_space_km2, 0.10, na.rm = TRUE),
-    p25  = quantile(activity_space_km2, 0.25, na.rm = TRUE),
-    p50_median = quantile(activity_space_km2, 0.50, na.rm = TRUE),
-    p75  = quantile(activity_space_km2, 0.75, na.rm = TRUE),
-    p90  = quantile(activity_space_km2, 0.90, na.rm = TRUE),
-    p95  = quantile(activity_space_km2, 0.95, na.rm = TRUE),
-    p99  = quantile(activity_space_km2, 0.99, na.rm = TRUE),
-    p100_max = quantile(activity_space_km2, 1, na.rm = TRUE)
-  )
-
-## 5. Wider bins across the FULL range (not just zoomed) — useful for seeing
-##    the whole shape including the tail, without a chart
-day_summary %>%
-  mutate(
-    area_bin = cut(
-      activity_space_km2,
-      breaks = c(0, 1, 2, 5, 10, 20, 50, 100, 500, 1000, Inf),
-      labels = c("0-1", "1-2", "2-5", "5-10", "10-20", "20-50",
-                 "50-100", "100-500", "500-1000", "1000+"),
-      include.lowest = TRUE
-    )
-  ) %>%
-  count(area_bin) %>%
-  mutate(pct = round(n / sum(n) * 100, 2))
+coeftest(
+  m_weekend_only,
+  vcov = vcovCL(m_weekend_only, cluster = ~ HOUSEID)
+)
 ```
+
+
 
